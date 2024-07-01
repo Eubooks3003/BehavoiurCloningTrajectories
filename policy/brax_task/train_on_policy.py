@@ -27,11 +27,11 @@ import optax
 import streamlit.components.v1 as components
 import tensorflow as tf
 from absl import logging
-from brax import envs
+from brax.v1 import envs
 from brax.io import html
 from brax.training import distribution
 from brax.training import networks
-from brax.training import normalization
+from brax.v1.experimental import normalization
 from brax.training import pmap
 from brax.training.types import PRNGKey
 from brax.training.types import Params
@@ -206,9 +206,9 @@ def train(
         key, key_sample = jax.random.split(key)
         # TODO: Make this nicer ([0] comes from pmapping).
         obs = obs_normalizer_apply_fn(
-            jax.tree_map(lambda x: x[0], normalizer_params), state.obs)
+            jax.tree.map(lambda x: x[0], normalizer_params), state.obs)
         print(obs.shape)
-        print(jax.tree_map(lambda x: x.shape, params))
+        print(jax.tree.map(lambda x: x.shape, params))
         logits = policy_model.apply(params, obs)
         actions = parametric_action_distribution.sample(logits, key_sample)
         nstate = eval_step_fn(state, actions)
@@ -216,11 +216,23 @@ def train(
 
     @jax.jit
     def run_eval(params, state, normalizer_params, key):
-        params = jax.tree_map(lambda x: x[0], params)
+        params = jax.tree.map(lambda x: x[0], params)
         (state, _, _, key), state_list = jax.lax.scan(
             do_one_step_eval, (state, params, normalizer_params, key), (),
             length=episode_length // action_repeat)
         return state, key, state_list
+    
+    def eval_unroll(agent, env, length):
+        """Return number of episodes and average reward for a single unroll."""
+        observation = env.reset()
+        episodes = torch.zeros((), device=agent.device)
+        episode_reward = torch.zeros((), device=agent.device)
+        for _ in range(length):
+            _, action = agent.get_logits_action(observation)
+            observation, reward, done, _ = env.step(Agent.dist_postprocess(action))
+            episodes += torch.sum(done)
+            episode_reward += torch.sum(reward)
+        return episodes, episode_reward / episodes
 
     def eval_policy(it, key_debug):
         global best_reward
@@ -230,6 +242,12 @@ def train(
                                                          training_state.normalizer_params,
                                                          key_debug)
             eval_metrics = eval_state.info['eval_metrics']
+            with torch.no_grad():
+                episode_count, episode_reward = eval_unroll(agent, env, episode_length)
+            print(dir(eval_metrics))
+            episode_metrics = eval_metrics.episode_metrics
+            print(dir(episode_metrics))
+            print(episode_metrics)
             eval_metrics.completed_episodes.block_until_ready()
             eval_sps = (
                     episode_length * eval_first_state.reward.shape[0] /
@@ -237,21 +255,18 @@ def train(
             avg_episode_length = (
                     eval_metrics.completed_episodes_steps /
                     eval_metrics.completed_episodes)
-            metrics = dict(
-                dict({
-                    f'eval/episode_{name}': value / eval_metrics.completed_episodes
-                    for name, value in eval_metrics.completed_episodes_metrics.items()
-                }),
-                **dict({
-                    'eval/completed_episodes': eval_metrics.completed_episodes,
-                    'eval/avg_episode_length': avg_episode_length,
-                    'speed/sps': sps,
-                    'speed/eval_sps': eval_sps,
-                    'speed/training_walltime': training_walltime,
-                    'speed/timestamp': training_walltime,
-                    'train/grad_norm': jnp.mean(summary.get('grad_norm', 0)),
-                    'train/params_norm': jnp.mean(summary.get('params_norm', 0)),
-                }))
+            metrics = {
+                'eval/episode_reward': episode_reward,
+                'eval/completed_episodes': episode_count,
+                'eval/avg_episode_length': episode_avg_length,
+                'speed/sps': sps,
+                'speed/eval_sps': eval_sps,
+                'losses/total_loss': total_loss,
+                'speed/training_walltime': training_walltime,
+                'speed/timestamp': training_walltime,
+                'train/grad_norm': jnp.mean(summary.get('grad_norm', 0)),
+                'train/params_norm': jnp.mean(summary.get('params_norm', 0))
+            }
 
             logging.info(metrics)
             if progress_fn:
@@ -267,8 +282,8 @@ def train(
                 best_reward = np.array(metrics['eval/episode_reward'])
                 # save params in pickle file
                 print('Saving params with reward', best_reward)
-                params = jax.tree_map(lambda x: x[0], training_state.policy_params)
-                normalizer_params = jax.tree_map(lambda x: x[0], training_state.normalizer_params)
+                params = jax.tree.map(lambda x: x[0], training_state.policy_params)
+                normalizer_params = jax.tree.map(lambda x: x[0], training_state.normalizer_params)
                 params_ = normalizer_params, params
                 with open(args.logdir + '/params.pkl', 'wb') as f:
                     pickle.dump(params_, f)
@@ -449,7 +464,7 @@ def train(
     # prepare training
     sps = 0
     training_walltime = 0
-    summary = {'params_norm': optax.global_norm(jax.tree_map(lambda x: x[0], policy_params))}
+    summary = {'params_norm': optax.global_norm(jax.tree.map(lambda x: x[0], policy_params))}
     key = jnp.stack(jax.random.split(key, local_devices_to_use))
     training_state = TrainingState(key=key, optimizer_state=optimizer_state,
                                    il_optimizer_state=il_optimizer_state,
@@ -469,7 +484,7 @@ def train(
             # il optimization
             training_state, summary, synchro = il_minimize(training_state)
             assert synchro[0], (it, training_state)
-            jax.tree_map(lambda x: x.block_until_ready(), summary)
+            jax.tree.map(lambda x: x.block_until_ready(), summary)
         eval_policy(0, key_debug)
 
     # main training loop
@@ -496,12 +511,12 @@ def train(
             tf.summary.scalar('grad_norm', data=np.array(metrics['grad_norm'])[0], step=num_steps)
             tf.summary.scalar('params_norm', data=np.array(metrics['params_norm'])[0], step=num_steps)
             assert synchro[0], (it, training_state)
-            jax.tree_map(lambda x: x.block_until_ready(), metrics)
+            jax.tree.map(lambda x: x.block_until_ready(), metrics)
             sps = (episode_length * num_envs) / (time.time() - t)
             training_walltime += time.time() - t
 
-    params = jax.tree_map(lambda x: x[0], training_state.policy_params)
-    normalizer_params = jax.tree_map(lambda x: x[0],
+    params = jax.tree.map(lambda x: x[0], training_state.policy_params)
+    normalizer_params = jax.tree.map(lambda x: x[0],
                                      training_state.normalizer_params)
     params = normalizer_params, params
     inference = make_inference_fn(core_env.observation_size, core_env.action_size,
